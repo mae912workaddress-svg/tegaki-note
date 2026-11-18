@@ -1,5 +1,5 @@
 import { PDFDocument, rgb, degrees, PDFName, PDFDict, PDFStream, pushGraphicsState, popGraphicsState, concatTransformationMatrix, drawObject, rectangle, clip, endPath } from '../../vendor/pdf-lib/pdf-lib.esm.min.js';
-import { getStroke } from '../../vendor/perfect-freehand/index.mjs';
+import { strokeOutline } from '../render/strokes.js';
 import { templateGeometry } from '../model/templates.js';
 import { itemWidth, itemHeight, fitImage } from '../model/images.js';
 import { pageAssets } from '../render/assets.js';
@@ -69,25 +69,42 @@ export async function exportPdf(pages, {getFile,rasterizeText,backgroundAssets =
     const target=pdf.addPage([page.width,page.height]), bg=page.background;
     target.drawRectangle({x:0,y:0,width:page.width,height:page.height,color:rgb(1,1,1)});
     if (bg?.type==='pdf') {
-      if (!sources.has(bg.fileId)) sources.set(bg.fileId,await PDFDocument.load(await (await getFile(bg.fileId)).blob.arrayBuffer()));
-      const source=sources.get(bg.fileId).getPage(bg.pageIndex);
-      if (!source) throw new Error('PDF背景のページがありません');
+      let source, vector = false;
       const sourceKey = `${bg.fileId}:${bg.pageIndex}`;
-      if (!appearances.has(sourceKey)) appearances.set(sourceKey, flattenDisplayAppearances(source));
-      if (!appearances.get(sourceKey)) {
-        const box = viewBox(source), unit = source.node.lookup(key('UserUnit'))?.asNumber() || 1;
-        const { ratio } = rasterSize({width:(box.right-box.left)*unit,height:(box.top-box.bottom)*unit},144);
+      try {
+        if (!sources.has(bg.fileId)) {
+          // pdf-lib cannot decrypt owner-password PDFs. Keep encrypted bytes out
+          // of the export and remember that this source requires PDF.js.
+          try { sources.set(bg.fileId,await PDFDocument.load(await (await getFile(bg.fileId)).blob.arrayBuffer())); }
+          catch { sources.set(bg.fileId,null); }
+        }
+        source = sources.get(bg.fileId)?.getPage(bg.pageIndex);
+        if (source) {
+          if (!appearances.has(sourceKey)) {
+            const compatible = flattenDisplayAppearances(source);
+            if (compatible && source.node.Contents()) {
+              // Embedding is lazy. Decode in a disposable document first: failed
+              // embeds must never remain queued and break the final save().
+              const probe = await PDFDocument.create();
+              const embedded = await probe.embedPage(source,viewBox(source));
+              await embedded.embed();
+            }
+            appearances.set(sourceKey,compatible);
+          }
+          vector = appearances.get(sourceKey);
+        }
+      } catch { appearances.set(sourceKey,false); }
+      if (!vector) {
+        const { ratio } = rasterSize(page,144);
         const assets = await backgroundAssets({...page,items:[]},getFile,ratio);
         try {
           const blob = await new Promise((resolve,reject) => assets.background.toBlob(b => b ? resolve(b) : reject(new Error('PDF背景の画像化に失敗しました')), 'image/png'));
           const img = await pdf.embedPng(await blob.arrayBuffer());
           target.drawImage(img,{x:0,y:0,width:page.width,height:page.height});
         } finally { assets.release(); }
-      // A valid blank PDF page can have no Contents stream to embed.
       } else if (source.node.Contents()) {
         const embedded=await pdf.embedPage(source,viewBox(source));
         const rotation=((source.getRotation().angle%360)+360)%360;
-        // /Rotate is clockwise; embedding ignores it, so apply it explicitly.
         const rotated=rotation===90 || rotation===270;
         const w=rotated ? page.height : page.width, h=rotated ? page.width : page.height;
         const positions={0:[0,0],90:[0,page.height],180:[page.width,page.height],270:[page.width,0]};
@@ -102,8 +119,8 @@ export async function exportPdf(pages, {getFile,rasterizeText,backgroundAssets =
     for (const [x1,y1,x2,y2] of geometry.lines) target.drawLine({start:{x:x1,y:page.height-y1},end:{x:x2,y:page.height-y2},thickness:.45,color:color('#dbe2df')});
     for (const [x,y] of geometry.dots) target.drawCircle({x,y:page.height-y,size:.65,color:color('#bbc9c3')});
     for (const stroke of page.strokes) {
-      const highlight=stroke.tool==='highlighter', points=highlight ? stroke.points.map(([x,y]) => [x,y,.5]) : stroke.points;
-      const outline=getStroke(points,{size:stroke.size,thinning:highlight ? 0 : .65,smoothing:.5,streamline:.3,simulatePressure:false,last:true});
+      const highlight=stroke.tool==='highlighter';
+      const outline=strokeOutline(stroke);
       if (outline.length) target.drawSvgPath(outline.map(([x,y],i) => `${i ? 'L' : 'M'} ${x} ${y}`).join(' ')+' Z',{x:0,y:page.height,color:color(stroke.color),opacity:highlight ? .35 : 1});
     }
     for (const item of page.items) {

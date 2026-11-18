@@ -1,6 +1,6 @@
 import { TEMPLATES } from './templates.js';
 import { itemWidth, itemHeight, validateImageContents } from './images.js';
-import { PDFDocument, PDFArray, PDFDict, PDFName, PDFRef, PDFRawStream, decodePDFRawStream } from '../../vendor/pdf-lib/pdf-lib.esm.min.js';
+import { openPdf, validatePdfPage } from '../import/pdf.js';
 const object = v => v !== null && typeof v === 'object' && !Array.isArray(v);
 const id = v => typeof v === 'string' && v.length > 0 && v.length <= 200;
 const name = v => typeof v === 'string' && v.trim().length > 0 && v.length <= 500;
@@ -71,179 +71,16 @@ export async function validateFileContents(records, options) {
   return records;
 }
 
-// Only import/restore call this preflight. Never cache decoded stream bodies.
-export async function validatePdfContents(blob, { maxStreamBytes = 200 * 1024 * 1024, maxTotalBytes = 1024 * 1024 * 1024, decodeFlate = decompressFlate } = {}) {
-  const pdf = await PDFDocument.load(new Uint8Array(await blob.arrayBuffer()), { throwOnInvalidObject: true });
-  if (!pdf.getPageCount()) throw new Error('PDFにページがありません');
-  const visited = new Set(), pending = [];
-  const budget = { remaining:maxTotalBytes, maxStreamBytes };
-  for (const page of pdf.getPages()) {
-    const { width, height } = page.getSize();
-    if (![width, height].every(n => Number.isFinite(n) && n > 0)) throw new Error('PDFのページ寸法が不正です');
-    const contents = page.node.Contents();
-    const streams = contents instanceof PDFArray
-      ? Array.from({ length:contents.size() }, (_, i) => contents.lookup(i)) : [contents];
-    for (const stream of streams) {
-      if (stream === undefined && contents === undefined) continue;
-      if (!(stream instanceof PDFRawStream)) throw new Error('PDFの本文ストリームが不正です');
-    }
-    pending.push(page.node.Resources()); // Include inherited resources as well.
-    for (const [key, child] of page.node.entries()) {
-      if (key !== PDFName.of('Parent')) pending.push(child);
-    }
-  }
-  // Iterative traversal handles shared/cyclic Forms, Patterns, font descriptors,
-  // soft masks, Shading functions and annotation appearance dictionaries alike.
-  while (pending.length) {
-    let value = pending.pop();
-    if (value instanceof PDFRef) {
-      value = pdf.context.lookup(value);
-      if (!value) throw new Error('PDFの参照先がありません');
-    }
-    if (!value || visited.has(value)) continue;
-    visited.add(value);
-    if (value instanceof PDFRawStream) {
-      await validateStream(value, budget, decodeFlate); pending.push(value.dict);
-    } else if (value instanceof PDFArray) {
-      for (let i = 0; i < value.size(); i++) pending.push(value.get(i));
-    } else if (value instanceof PDFDict) {
-      // Annotation /P and field parents may link back to page trees. Check the
-      // target type, not the key: a perfectly valid Pattern/XObject can be /P.
-      const type = value.get(PDFName.of('Type'));
-      if (type instanceof PDFName && ['/Page','/Pages'].includes(type.asString())) continue;
-      for (const [, child] of value.entries()) pending.push(child);
-    }
-  }
-  return pdf;
-}
-
-const filterNames = { Fl:'FlateDecode', LZW:'LZWDecode', AHx:'ASCIIHexDecode', A85:'ASCII85Decode', RL:'RunLengthDecode', DCT:'DCTDecode' };
-const supportedFilters = new Set(['FlateDecode','LZWDecode','ASCIIHexDecode','ASCII85Decode','RunLengthDecode']);
-async function validateStream(raw, budget, decodeFlate) {
-  let bytes = raw.getContents();
-  const length = raw.dict.lookup(PDFName.of('Length'));
-  if (length?.asNumber?.() !== bytes.length) throw new Error('PDFのストリーム長が不正です');
-  const filter = raw.dict.lookup(PDFName.of('Filter')), params = raw.dict.lookup(PDFName.of('DecodeParms'));
-  const filters = filter instanceof PDFArray ? Array.from({length:filter.size()}, (_,i) => filter.lookup(i)) : filter ? [filter] : [];
-  const checkSize = size => {
-    if (size > budget.maxStreamBytes || size > budget.remaining) throw new Error('PDFのストリーム展開量が上限を超えました');
-  };
-  checkSize(bytes.length);
-  if (!filters.length) { budget.remaining -= bytes.length; return; }
-  for (let i = 0; i < filters.length; i++) {
-    if (!(filters[i] instanceof PDFName)) throw new Error('PDFのフィルターが不正です');
-    const name = filters[i].decodeText(), canonical = filterNames[name] || name;
-    if (!supportedFilters.has(canonical)) {
-      if (!bytes.length) throw new Error('PDFの画像ストリームがありません');
-      if (canonical === 'DCTDecode') validateJpegStream(bytes);
-      // JPX/JBIG2/CCITT and other codecs are handled by the rendering engine.
-      // Their output cannot be passed to subsequent filters by this validator.
-      budget.remaining -= bytes.length;
-      return;
-    }
-    const dict = raw.dict.clone(); dict.set(PDFName.of('Filter'), PDFName.of(canonical));
-    const param = params instanceof PDFArray ? params.lookup(i) : params;
-    if (param) dict.set(PDFName.of('DecodeParms'), param); else dict.delete(PDFName.of('DecodeParms'));
-    let decoder;
-    try {
-      if (canonical === 'FlateDecode') {
-        bytes = await strictFlate(bytes, dict, decodeFlate, checkSize, Math.min(budget.maxStreamBytes, budget.remaining));
-        checkSize(bytes.length);
-        budget.remaining -= bytes.length;
-        continue;
-      }
-      decoder = decodePDFRawStream(PDFRawStream.of(dict, bytes));
-      const ensure = decoder.ensureBuffer.bind(decoder);
-      // Guard allocations, not merely the final decoded length. Each stage of
-      // a filter chain counts toward the total work/memory budget.
-      decoder.ensureBuffer = size => { checkSize(size); return ensure(size); };
-      while (!decoder.eof) { decoder.readBlock(); checkSize(decoder.bufferLength); }
-      bytes = decoder.buffer.subarray(0, decoder.bufferLength);
-      budget.remaining -= bytes.length;
-    } catch (error) {
-      if (error.message.includes('上限')) throw error;
-      throw new Error('PDFの本文ストリームを展開できません');
-    } finally {
-      if (decoder) decoder.buffer = new Uint8Array(0);
-    }
-  }
-}
-
-// Read through EOF: a partial output is not proof of a complete zlib stream.
-// Do not retry corrupt zlib as raw deflate: that would bypass its checksum.
-async function decompressFlate(bytes, { maxOutputBytes }) {
-  const reader = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate')).getReader();
-  const chunks = []; let size = 0;
+// Use the same tolerant display engine as the editor, one page at a time.
+export async function validatePdfContents(blob, { openPdf: open = openPdf } = {}) {
+  const pdf = await open(blob);
   try {
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      size += value.length;
-      if (size > maxOutputBytes) throw new Error('PDFのストリーム展開量が上限を超えました');
-      chunks.push(value);
+    if (!pdf.numPages) throw new Error('PDFにページがありません');
+    for (let i = 1; i <= pdf.numPages; i++) {
+      const page = await pdf.getPage(i);
+      try { await validatePdfPage(page); } finally { page.cleanup(); }
     }
-    const output = new Uint8Array(size); let offset = 0;
-    for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.length; }
-    return output;
-  } finally {
-    await reader.cancel().catch(() => {});
-    reader.releaseLock();
-  }
-}
-
-async function strictFlate(bytes, dict, decode, checkSize, maxOutputBytes) {
-  try { return await decode(bytes, { maxOutputBytes }); }
-  catch (error) {
-    if (error.message.includes('上限')) throw error;
-    // Some DecompressionStream implementations reject trailing PDF whitespace
-    // or garbage. Locate a candidate end only on failure, then validate that
-    // exact prefix again with the STRICT decoder, including all four Adler bytes.
-    // pdf-lib's permissive EOF is never itself accepted as validation.
-    let locator;
-    try {
-      locator = decodePDFRawStream(PDFRawStream.of(dict, bytes));
-      const ensure = locator.ensureBuffer.bind(locator);
-      locator.ensureBuffer = size => { checkSize(size); return ensure(size); };
-      while (!locator.eof) { locator.readBlock(); checkSize(locator.bufferLength); }
-      // Huffman lookahead may have read whole bytes beyond the final block.
-      const end = locator.stream.pos - Math.floor(locator.codeSize / 8) + 4;
-      if (!Number.isSafeInteger(end) || end <= 0 || end >= bytes.length) throw error;
-      locator.buffer = new Uint8Array(0);
-      return await decode(bytes.subarray(0, end), { maxOutputBytes });
-    } finally {
-      if (locator) locator.buffer = new Uint8Array(0);
-    }
-  }
-}
-
-// JPEG marker/segment validation without allocating decoded pixels.
-function validateJpegStream(bytes) {
-  const fail = () => { throw new Error('PDFのJPEGストリームが不正です'); };
-  if (bytes[0] !== 255 || bytes[1] !== 216) fail();
-  let offset = 2, frame = false, scan = false, entropy = false;
-  while (offset < bytes.length) {
-    if (bytes[offset++] !== 255) fail();
-    while (bytes[offset] === 255) offset++;
-    const marker = bytes[offset++];
-    if (marker === 217) { if (!frame || !scan || !entropy) fail(); return; }
-    if (!marker || marker === 216 || marker >= 208 && marker <= 215) fail();
-    if (marker === 1) continue;
-    const length = bytes[offset] * 256 + bytes[offset + 1];
-    if (!(length >= 2) || offset + length > bytes.length) fail();
-    if (marker >= 192 && marker <= 207 && ![196,200,204].includes(marker)) {
-      if (length < 8 || !((bytes[offset+3]*256+bytes[offset+4]) > 0) || !((bytes[offset+5]*256+bytes[offset+6]) > 0)) fail();
-      frame = true;
-    }
-    if (marker === 218 && (length < 6 || length !== 6 + 2 * bytes[offset+2])) fail();
-    offset += length;
-    if (marker === 218) {
-      scan = true;
-      while (offset < bytes.length) {
-        if (bytes[offset] !== 255) { entropy = true; offset++; }
-        else if (bytes[offset+1] === 0 || bytes[offset+1] >= 208 && bytes[offset+1] <= 215) { entropy = true; offset += 2; }
-        else break;
-      }
-    }
-  }
-  fail();
+    const count = pdf.numPages;
+    return { getPageCount: () => count };
+  } finally { await pdf.destroy(); }
 }

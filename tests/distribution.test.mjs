@@ -34,7 +34,7 @@ test('承認依存だけを固定し、配布ファイルとLICENSEを同梱す�
 test('PNGアイコンの寸法が180/192/512pxである', async () => { for (const size of [180, 192, 512]) { const data = await readFile(new URL(`icons/${size === 180 ? 'apple-touch-icon' : `icon-${size}`}.png`, root)); assert.equal(data.subarray(1, 4).toString(), 'PNG'); assert.equal(data.readUInt32BE(16), size); assert.equal(data.readUInt32BE(20), size); } });
 test('高倍率でもcanvasメモリーを制限し解放する', () => {
   const canvas = { style: {}, getContext: () => ({ setTransform() {} }), remove() { this.removed = true; } };
-  configureCanvas(canvas, { width: 595.28, height: 841.89 }, 4, 3); assert.ok(canvas.width * canvas.height < 1804000); assert.equal(canvas.style.width, `${595.28 * 4}px`);
+  configureCanvas(canvas, { width: 595.28, height: 841.89 }, 4, 3); assert.ok(canvas.width * canvas.height <= 4000000); assert.equal(canvas.style.width, `${595.28 * 4}px`);
   releaseCanvas(canvas); assert.equal(canvas.width, 0); assert.equal(canvas.height, 0); assert.equal(canvas.removed, true);
 });
 test('静的サーバーの実プロセスで index・sw・vendor がHTTP 200、終了を確認', { timeout: 15000 }, async () => {

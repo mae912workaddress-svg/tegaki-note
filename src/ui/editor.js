@@ -4,6 +4,7 @@ import { History } from '../model/history.js';
 import { eraseAt, selectStrokes, strokeHit } from '../model/geometry.js';
 import { Autosave } from '../storage/autosave.js';
 import { configureCanvas, clearCanvas, drawStroke, renderPage, releaseCanvas, textLines } from '../render/page.js';
+import { pointerPressure, appendStrokePoint } from '../render/strokes.js';
 import { pageAssets } from '../render/assets.js';
 import { prepareImage } from '../import/images.js';
 import { itemWidth,itemHeight,fitImage } from '../model/images.js';
@@ -176,7 +177,7 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
     for (const [id, shell] of shells) { const p = pages.get(id); shell.style.width = `${p.width * scale}px`; shell.style.height = `${p.height * scale}px`; width = Math.max(width, p.width * scale); }
     stack.style.width = `${width}px`;
     for (const [id, layer] of mounted) {
-      layer.baseContext = configureCanvas(layer.base, pages.get(id), scale); layer.liveContext = configureCanvas(layer.live, pages.get(id), scale); redraw(id);
+      layer.baseContext = configureCanvas(layer.base, pages.get(id), scale); layer.liveContext = configureCanvas(layer.live, pages.get(id), scale); redraw(id);refreshAssets(id);
     }
     updateToolbar();
   }
@@ -214,7 +215,7 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
   }
   function coordinates(event, id) {
     const p = pages.get(id), rect = shells.get(id).getBoundingClientRect();
-    return [Math.max(0, Math.min(p.width, (event.clientX - rect.left) / scale)), Math.max(0, Math.min(p.height, (event.clientY - rect.top) / scale)), event.pressure > 0 ? Math.min(1, event.pressure) : .5];
+    return [Math.max(0, Math.min(p.width, (event.clientX - rect.left) / scale)), Math.max(0, Math.min(p.height, (event.clientY - rect.top) / scale)), pointerPressure(event)];
   }
   function commit(page, before) {
     if (history(page.id).commit(before, pageContent(page))) autosave.mark(page); updateToolbar();
@@ -301,13 +302,13 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
     if (mode === 'erase') applyEraser(point);
     schedulePaint(); updateToolbar();
   });
-  function moveInput(event) {
+  function moveInput(event, terminal = false) {
     if (!active || event.pointerId !== active.pointerId) return;
     event.preventDefault();
     const events = typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : [];
     for (const e of events.length ? events : [event]) {
       const point = coordinates(e, active.pageId), page = pages.get(active.pageId);
-      if (active.mode === 'draw') active.stroke.points.push(point);
+      if (active.mode === 'draw') appendStrokePoint(active.stroke.points, point, { terminal:terminal && active.type === 'pen' });
       else if (active.mode === 'lasso') active.points.push(point);
       else if (active.mode === 'erase') applyEraser(point);
       else Object.assign(page,moveContent(active.before,selected.ids,point[0]-active.start[0],point[1]-active.start[1],page.width,page.height));
@@ -315,7 +316,7 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
     schedulePaint();
   }
   listen(stack, 'pointermove', moveInput);
-  listen(stack, 'pointerup', event => { if (active?.pointerId === event.pointerId) { moveInput(event); finishInput(true); } });
+  listen(stack, 'pointerup', event => { if (active?.pointerId === event.pointerId) { moveInput(event, true); finishInput(true); } });
   listen(stack, 'pointercancel', event => { if (active?.pointerId === event.pointerId) finishInput(false); });
   listen(stack, 'lostpointercapture', event => { if (active?.pointerId === event.pointerId) finishInput(false); });
   const touches = event => [...event.touches].filter(t => t.touchType !== 'stylus');
@@ -357,7 +358,7 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
   listen(window, 'pageshow', event => { if (event.persisted) return resume(); });
   listen(window, 'focus', resume);
   listen(window, 'pagehide', flushOnHide);
-  listen(window, 'resize', () => { updateViewport(); });
+  listen(window, 'resize', () => { finishInput(true); layout(); updateViewport(); });
   listen(window, 'keydown', event => {
     if (event.target.matches('input,select,textarea')) return;
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); historyAction(event.shiftKey ? 'redo' : 'undo'); }

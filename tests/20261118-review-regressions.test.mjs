@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { deflateSync, inflateSync, constants as zlibConstants } from 'node:zlib';
+import { deflateSync, constants as zlibConstants } from 'node:zlib';
 import { Repository } from '../src/storage/db.js';
 import { createLocks } from './helpers/20261118-locks.mjs';
 import { createBackup, decodeBase64 } from '../src/storage/backup.js';
@@ -16,7 +16,6 @@ import { PDFDocument, PDFName, PDFString, PDFBool, degrees } from '../vendor/pdf
 import { OPS } from '../vendor/pdfjs/pdf.mjs';
 import { validatePdfContents } from '../src/model/validation.js';
 
-const strictNodeFlate = (bytes, { maxOutputBytes }) => inflateSync(bytes, { maxOutputLength:maxOutputBytes });
 function ascii85(bytes) {
   let text = '';
   for (let i = 0; i < bytes.length; i += 4) {
@@ -34,83 +33,74 @@ async function flatePdf(bytes, chain = false) {
   })));
   return await pdf.save();
 }
-for (const [decoderName, options] of [['DecompressionStream',{}], ['node:zlib',{decodeFlate:strictNodeFlate}]]) {
-  for (const mode of ['先頭9バイト','チェックサム欠落','チェックサム不一致','ASCII85連結の先頭9バイト']) {
-    test(`REV-011: ${decoderName}で${mode}の復元・取込みを拒否し既存全ストアを保持する`, async () => {
-      const compressed = deflateSync(Buffer.from('BT /F1 12 Tf 20 100 Td (VISIBLE TEXT) Tj ET'), {level:0});
-      const chain = mode.startsWith('ASCII85');
-      let broken = compressed;
-      if (mode.includes('9バイト')) broken = compressed.subarray(0,9);
-      else if (mode === 'チェックサム欠落') broken = compressed.subarray(0,-1);
-      else { broken = Buffer.from(compressed); broken[broken.length-1] ^= 1; }
-      const pdf = await flatePdf(broken, chain), raw = records();
-      raw.folders.push({id:'folder',name:'既存フォルダ',order:0,createdAt:1,updatedAt:1});
-      raw.notebooks[0].folderId = 'folder';
-      const db = database(raw), repo = new Repository(db), before = structuredClone(db.state);
-      await assert.rejects(repo.restoreBackup(await createBackup(records(pdf,'application/pdf')),options), /本文ストリームを展開できません/);
-      assert.deepEqual(db.state,before); assert.equal(db.observed.length,0);
-      await assert.rejects(async () => {
-        const imported = await importFiles([new File([pdf],'truncated.pdf',{type:'application/pdf'})],null,options);
-        await repo.importRecords(imported);
-      }, /本文ストリームを展開できません/);
-      assert.deepEqual(db.state,before); assert.equal(db.observed.length,0);
-    });
-  }
+for (const mode of ['先頭9バイト','チェックサム欠落','チェックサム不一致','ASCII85連結の先頭9バイト']) {
+  test(`USR-001/REV-011: ${mode}のバックアップ後破損をSHA-256で拒否し既存全ストアを保持する`, async () => {
+    const compressed = deflateSync(Buffer.from('q 1 0 0 rg 20 20 40 40 re f Q'), {level:0});
+    const chain = mode.startsWith('ASCII85');
+    let broken;
+    if (mode.includes('9バイト')) broken = compressed.subarray(0,9);
+    else if (mode === 'チェックサム欠落') broken = compressed.subarray(0,-1);
+    else { broken = Buffer.from(compressed); broken[broken.length-1] ^= 1; }
+    const backup = await createBackup(records(await flatePdf(compressed,chain),'application/pdf'));
+    backup.files[0].base64 = Buffer.from(await flatePdf(broken,chain)).toString('base64');
+    const raw = records(); raw.folders.push({id:'folder',name:'既存フォルダ',order:0,createdAt:1,updatedAt:1}); raw.notebooks[0].folderId='folder';
+    const db=database(raw),repo=new Repository(db),before=structuredClone(db.state);
+    await assert.rejects(repo.restoreBackup(backup), /SHA-256またはバイト長/);
+    assert.deepEqual(db.state,before); assert.equal(db.observed.length,0);
+  });
 }
 
 for (const [mode, compression] of [['stored',{level:0}], ['fixed',{strategy:zlibConstants.Z_FIXED}], ['dynamic',{level:9}]]) {
   test(`REV-011: ${mode}の正常Flate末尾の改行・ゴミを復元・取込み・連結フィルターで許容する`, async () => {
     const compressed = deflateSync(Buffer.from('q Q\n'.repeat(1000)),compression);
-    // Model a browser that rejects any bytes after the first zlib stream.
-    let trimmed = 0;
-    const rejectTrailing = (bytes, options) => {
-      const decoded = inflateSync(bytes,{info:true,maxOutputLength:options.maxOutputBytes});
-      if (decoded.engine.bytesWritten !== bytes.length) throw new Error('Trailing bytes');
-      trimmed++; return decoded.buffer;
-    };
     for (const tail of [Buffer.from('\r\n'),Buffer.from([0,255,1,2,3,10])]) {
       const bytes = Buffer.concat([compressed,tail]);
       for (const chain of [false,true]) {
         const pdf = await flatePdf(bytes,chain);
-        for (const options of [{},{decodeFlate:strictNodeFlate},{decodeFlate:rejectTrailing}]) {
-          const db = database(records()), repo = new Repository(db);
-          await repo.restoreBackup(await createBackup(records(pdf,'application/pdf')),options);
-          assert.deepEqual((await repo.load()).warnings,[]);
-          const imported = await importFiles([new File([pdf],'trailing.pdf',{type:'application/pdf'})],null,options);
-          assert.equal(imported.pages.length,1);
-        }
+        const db = database(records()), repo = new Repository(db);
+        await repo.restoreBackup(await createBackup(records(pdf,'application/pdf')));
+        assert.deepEqual((await repo.load()).warnings,[]);
+        const imported = await importFiles([new File([pdf],'trailing.pdf',{type:'application/pdf'})],null);
+        assert.equal(imported.pages.length,1);
       }
     }
-    assert.equal(trimmed,8);
+
   });
 }
 
-test('REV-011: 末尾ゴミの再検証でも途中終了・チェックサム破損を許容しない', async () => {
+test('USR-001/REV-011: 末尾ゴミ付きの途中終了・チェックサム破損を復元ハッシュで拒否する', async () => {
   const compressed = deflateSync(Buffer.from('q Q'),{level:0});
   for (const damaged of [compressed.subarray(0,9),compressed.subarray(0,-1),Buffer.from(compressed)]) {
     if (damaged.length === compressed.length) damaged[damaged.length-1] ^= 1;
-    await assert.rejects(validatePdfContents(new Blob([await flatePdf(Buffer.concat([damaged,Buffer.from('\nextra garbage')]))])), /本文ストリームを展開できません/);
+    const backup=await createBackup(records(await flatePdf(compressed),'application/pdf'));
+    backup.files[0].base64=Buffer.from(await flatePdf(Buffer.concat([damaged,Buffer.from('\nextra garbage')]))).toString('base64');
+    const db=database(records()),before=structuredClone(db.state);
+    await assert.rejects(new Repository(db).restoreBackup(backup),/SHA-256またはバイト長/);
+    assert.deepEqual(db.state,before);assert.equal(db.observed.length,0);
   }
 });
 
-test('REV-009: embedPdfのForm先頭1,2への破損を復元・取込みで拒否し既存全ストアを保持する', async () => {
+test('USR-001/REV-009: embedPdfのForm破損を復元ハッシュで拒否し全ストアを保持する', async () => {
   const original = await PDFDocument.create(); original.addPage().drawText('Embedded text');
   const outer = await PDFDocument.create(), [embedded] = await outer.embedPdf(await original.save());
   outer.addPage().drawPage(embedded);
   const parsed = await PDFDocument.load(await outer.save());
   const xobjects = parsed.getPage(0).node.Resources().lookup(PDFName.of('XObject'));
   const form = xobjects.lookup(xobjects.keys()[0]);
+  const backup = await createBackup(records(await parsed.save(),'application/pdf'));
   const bytes = form.getContents(); bytes[0] = 1; bytes[1] = 2;
   const corrupted = await parsed.save(), db = database(records()), repo = new Repository(db), before = structuredClone(db.state);
-  await assert.rejects(repo.restoreBackup(await createBackup(records(corrupted,'application/pdf'))), /本文ストリームを展開できません/);
+  backup.files[0].base64=Buffer.from(corrupted).toString('base64');
+  await assert.rejects(repo.restoreBackup(backup), /SHA-256またはバイト長/);
   assert.deepEqual(db.state, before); assert.equal(db.observed.length, 0);
-  await assert.rejects(importFiles([new File([corrupted],'form.pdf',{type:'application/pdf'})]), /本文ストリームを展開できません/);
+  // PDF.js warnings are accepted during import; restore checks byte identity.
+  assert.equal((await importFiles([new File([corrupted],'form.pdf',{type:'application/pdf'})])).pages.length,1);
 });
 
 for (const path of ['Form/Resources/XObject','Pattern','Shading/Function','Font/FontDescriptor/FontFile2','Annots/AP/N','Thumb','Metadata']) {
-  test(`REV-009: ${path}の到達可能ストリーム破損を循環参照があっても拒否する`, async () => {
+  test(`REV-009: ${path}の到達可能ストリーム破損を復元ハッシュで拒否する`, async () => {
     const pdf = await PDFDocument.create(), page = pdf.addPage(), context = pdf.context;
-    const bad = context.flateStream('q Q'), ref = context.register(bad); bad.getContents().set([1,2]);
+    const bad = context.flateStream('q Q'), ref = context.register(bad);
     const resources = page.node.Resources();
     if (path === 'Form/Resources/XObject') {
       const form = context.flateStream('q Q',{Type:'XObject',Subtype:'Form'}), formRef = context.register(form);
@@ -121,11 +111,15 @@ for (const path of ['Form/Resources/XObject','Pattern','Shading/Function','Font/
     else if (path === 'Shading/Function') resources.set(PDFName.of('Shading'),context.obj({S:{Function:ref}}));
     else if (path === 'Pattern') resources.set(PDFName.of('Pattern'),context.obj({P:ref}));
     else page.node.set(PDFName.of(path),ref);
-    await assert.rejects(validatePdfContents(new Blob([await pdf.save()])), /本文ストリームを展開できません/);
+    const backup=await createBackup(records(await pdf.save(),'application/pdf'));
+    bad.getContents().set([1,2]); backup.files[0].base64=Buffer.from(await pdf.save()).toString('base64');
+    const db=database(records()),before=structuredClone(db.state);
+    await assert.rejects(new Repository(db).restoreBackup(backup),/SHA-256またはバイト長/);
+    assert.deepEqual(db.state,before);assert.equal(db.observed.length,0);
   });
 }
 
-test('REV-009: 対応する5フィルターと連結・共有Form循環を展開し未対応codecは存在確認する', async () => {
+test('USR-001: 5フィルターと連結・共有Form循環を含むPDFを表示エンジンで検証する', async () => {
   const pdf = await PDFDocument.create(), page = pdf.addPage(), c = pdf.context;
   const plain = Buffer.from('q Q'), flate = deflateSync(plain);
   const bits = [256,113,32,81,257].map(n => n.toString(2).padStart(9,'0')).join('').padEnd(48,'0');
@@ -147,34 +141,13 @@ test('REV-009: 対応する5フィルターと連結・共有Form循環を展開
   await validatePdfContents(new Blob([await pdf.save()]));
 });
 
-test('REV-009: DCTのJPEG構造破損・未対応codecの空本文・展開量の個別/合計超過を拒否する', async () => {
-  const jpeg = Buffer.from([255,216,255,192,0,11,8,0,1,0,1,1,1,17,0,255,218,0,8,1,1,0,0,63,0,42,255,217]);
-  async function blobFor(bytes, filter, count=1) {
-    const pdf = await PDFDocument.create(), page = pdf.addPage(), objects = {};
-    for (let i=0;i<count;i++) objects['S'+i] = pdf.context.register(pdf.context.stream(bytes,{Filter:filter}));
-    page.node.Resources().set(PDFName.of('XObject'),pdf.context.obj(objects));
-    return new Blob([await pdf.save()]);
-  }
-  await validatePdfContents(await blobFor(jpeg,'DCTDecode'));
-  await assert.rejects(validatePdfContents(await blobFor(jpeg.subarray(0,-2),'DCTDecode')), /JPEG/);
-  await assert.rejects(validatePdfContents(await blobFor(new Uint8Array(),'JPXDecode')), /ストリームがありません/);
-  const compressed = deflateSync(Buffer.alloc(4096,65));
-  await assert.rejects(validatePdfContents(await blobFor(compressed,'FlateDecode'),{maxStreamBytes:2048}), /上限/);
-  await assert.rejects(validatePdfContents(await blobFor(compressed,'FlateDecode',2),{maxTotalBytes:6144}), /上限/);
-});
-
-test('性能: 100ページPDFの取込み・復元時だけ展開検証しopenPdfの繰返し表示では再検証しない', async t => {
-  const pdf = await PDFDocument.create(); for (let i=0;i<100;i++) pdf.addPage();
-  const file = new File([await pdf.save()],'100.pdf',{type:'application/pdf'});
-  const original = PDFDocument.load; let validations = 0;
-  t.mock.method(PDFDocument,'load',function(...args) { validations++; return original.apply(this,args); });
-  const imported = await importFiles([file]); assert.equal(imported.pages.length,100); assert.equal(validations,1);
-  const repo = new Repository(database(records())); await repo.restoreBackup(await createBackup(imported)); assert.equal(validations,2);
-  for (let i=0;i<3;i++) {
-    const shown = await openPdf(file);
-    try { for (let page=1;page<=100;page++) await shown.getPage(page); } finally { await shown.destroy(); }
-  }
-  assert.equal(validations,2);
+test('USR-001: 100ページの取込み・復元はpdf-libや独自展開を呼ばずPDF.jsで検証する', async t => {
+  const pdf=await PDFDocument.create();for(let i=0;i<100;i++)pdf.addPage();
+  const file=new File([await pdf.save()],'100.pdf',{type:'application/pdf'});
+  t.mock.method(PDFDocument,'load',()=>{throw new Error('strict parser must not run');});
+  const imported=await importFiles([file]);assert.equal(imported.pages.length,100);
+  const repo=new Repository(database(records()));await repo.restoreBackup(await createBackup(imported));
+  for(let i=0;i<3;i++){const shown=await openPdf(file);try{assert.equal(shown.numPages,100);}finally{await shown.destroy();}}
 });
 
 // Serializes transactions like IndexedDB (including different Repository instances).
@@ -441,6 +414,7 @@ for (const mode of ['単一ストリーム','配列の後続ストリーム','�
     source.addPage([300,500]).drawText('Valid first text');
     if (mode === '後続ページ') source.addPage([300,500]).drawText('Second page text');
     const parsed = await PDFDocument.load(await source.save());
+    const backup = await createBackup(records(await parsed.save(),'application/pdf'));
     const page = parsed.getPage(mode === '後続ページ' ? 1 : 0);
     const contents = page.node.Contents(), stream = contents.lookup(0);
     if (mode === '単一ストリーム') page.node.set(PDFName.of('Contents'),contents.get(0));
@@ -453,10 +427,10 @@ for (const mode of ['単一ストリーム','配列の後続ストリーム','�
     assert.equal(structure.getPageCount(),mode === '後続ページ' ? 2 : 1);
     assert.deepEqual(structure.getPage(0).getSize(),{width:300,height:500});
     const db = database(records()), repo = new Repository(db), before = structuredClone(db.state);
-    const backup = await createBackup(records(corrupted,'application/pdf'));
-    await assert.rejects(repo.restoreBackup(backup),/本文ストリームを展開できません/);
+    backup.files[0].base64=Buffer.from(corrupted).toString('base64');
+    await assert.rejects(repo.restoreBackup(backup),/SHA-256またはバイト長/);
     assert.deepEqual(db.state,before); assert.equal(db.observed.length,0);
-    await assert.rejects(importFiles([new File([corrupted],'broken.pdf',{type:'application/pdf'})]),/本文ストリームを展開できません/);
+    assert.equal((await importFiles([new File([corrupted],'broken.pdf',{type:'application/pdf'})])).pages.length,structure.getPageCount());
   });
 }
 test('REV-009: 正常な複数Contentsと本文なしページを復元・取込みできる',async () => {
@@ -482,4 +456,41 @@ test('REV-007: バックアップは参照画像2件のみ含め順次検証し�
   const before=structuredClone(db.state);
   await assert.rejects(repo.restoreBackup(backup,{decode:async()=>{throw new Error('decode failed');}}),/decode failed/);
   assert.deepEqual(db.state,before);
+});
+
+
+test('USR-001: 1バイト改変・長さ変更・整合性情報欠落を拒否し既存全ストアを保持する',async()=>{
+  const raw=records();raw.folders.push({id:'f',name:'keep',order:0,createdAt:1,updatedAt:1});raw.notebooks[0].folderId='f';
+  const backup=await createBackup(raw),db=database(raw),repo=new Repository(db),before=structuredClone(db.state);
+  for(const mutate of [
+    b=>{const bytes=Buffer.from(b.files[0].base64,'base64');bytes[bytes.length-1]^=1;b.files[0].base64=bytes.toString('base64');},
+    b=>{b.files[0].base64=Buffer.from(b.files[0].base64,'base64').subarray(0,-1).toString('base64');},
+    b=>{b.files[0].byteLength++;},b=>{delete b.files[0].sha256;},b=>{delete b.files[0].byteLength;},b=>{b.files[0].sha256='0'.repeat(64);}
+  ]) {
+    const bad=structuredClone(backup);mutate(bad);await assert.rejects(repo.restoreBackup(bad),/SHA-256/);
+    assert.deepEqual(db.state,before);assert.equal(db.observed.length,0);
+  }
+  const legacy=structuredClone(backup);legacy.version=1;delete legacy.files[0].sha256;delete legacy.files[0].byteLength;
+  await repo.restoreBackup(legacy);assert.deepEqual(db.state,before);
+  db.observed.length=0;
+  const badLegacy=structuredClone(legacy);badLegacy.files[0].base64=Buffer.from('broken PNG').toString('base64');
+  await assert.rejects(repo.restoreBackup(badLegacy),/PNG/);assert.deepEqual(db.state,before);assert.equal(db.observed.length,0);
+});
+
+
+test('USR-001: 後続ファイルのハッシュ不一致なら前のファイルもデコードせず全ストアを保持する',async()=>{
+  const raw=records(),db=database(raw),repo=new Repository(db),before=structuredClone(db.state);
+  raw.files.push(file('second',png()));raw.pages[1].background={type:'image',fileId:'second'};
+  const backup=await createBackup(raw),bytes=Buffer.from(backup.files[1].base64,'base64');bytes[bytes.length-1]^=1;backup.files[1].base64=bytes.toString('base64');
+  let decodes=0;
+  await assert.rejects(repo.restoreBackup(backup,{decode:async()=>{decodes++;throw new Error('must not decode');}}),/SHA-256またはバイト長/);
+  assert.equal(decodes,0);assert.deepEqual(db.state,before);assert.equal(db.observed.length,0);
+});
+
+test('USR-001: 復元の後続ページ演算子取得失敗でも書込みを始めず全ストアを保持する',async()=>{
+  const pdf=await PDFDocument.create();pdf.addPage();pdf.addPage();
+  const backup=await createBackup(records(await pdf.save(),'application/pdf'));
+  const db=database(records()),repo=new Repository(db),before=structuredClone(db.state),events=[];
+  await assert.rejects(repo.restoreBackup(backup,{openPdf:async()=>({numPages:2,getPage:async n=>({getViewport:()=>({width:300,height:500}),getOperatorList:async()=>{events.push(n);if(n===2)throw new Error('bad operators');},cleanup:()=>events.push('clean'+n)}),destroy:async()=>events.push('destroy')})}),/bad operators/);
+  assert.deepEqual(events,[1,'clean1',2,'clean2','destroy']);assert.deepEqual(db.state,before);assert.equal(db.observed.length,0);
 });

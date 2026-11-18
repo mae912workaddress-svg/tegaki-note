@@ -23,6 +23,7 @@ self.PRECACHE = [
   "./src/model/validation.js",
   "./src/render/assets.js",
   "./src/render/page.js",
+  "./src/render/strokes.js",
   "./src/storage/autosave.js",
   "./src/storage/backup.js",
   "./src/storage/db.js",

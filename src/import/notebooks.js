@@ -1,12 +1,11 @@
 import { createNotebook, createPage, uid } from '../model/notebooks.js';
 import { imagePageLayout } from '../model/images.js';
 import { prepareImage } from './images.js';
-import { openPdf } from './pdf.js';
-import { validatePdfContents } from '../model/validation.js';
+import { openPdf, validatePdfPage } from './pdf.js';
 import { assertRecords } from '../storage/backup.js';
 export async function importFiles(input, folderId = null, adapters = {}) {
   const inputs = [...input]; if (!inputs.length) throw new Error('ファイルを選んでください');
-  const prepare = adapters.prepareImage || prepareImage, pdfOpen = adapters.openPdf || (async file => { await validatePdfContents(file, adapters); return openPdf(file); });
+  const prepare = adapters.prepareImage || prepareImage, pdfOpen = adapters.openPdf || openPdf;
   const result = { folders:[], notebooks:[], pages:[], files:[] }; let jpgNotebook;
   for (const file of inputs) {
     const head = new Uint8Array(await file.slice(0,5).arrayBuffer());
@@ -15,13 +14,17 @@ export async function importFiles(input, folderId = null, adapters = {}) {
     if (isPdf) {
       const pdf = await pdfOpen(file), fileId = uid();
       try {
+        if (!pdf.numPages) throw new Error('PDFにページがありません');
         const {notebook} = createNotebook({name}); notebook.pageIds=[];
         for (let i=0;i<pdf.numPages;i++) {
-          const source = await pdf.getPage(i+1), view = source.getViewport({scale:1});
-          const page = createPage(notebook.id,{width:view.width,height:view.height});
-          page.background={type:'pdf',fileId,pageIndex:i};
-          const text = await source.getTextContent(); page.text=text.items.map(t => t.str + (t.hasEOL ? '\n' : ' ')).join('');
-          notebook.pageIds.push(page.id); result.pages.push(page); source.cleanup();
+          const source = await pdf.getPage(i+1);
+          try {
+            const view = await validatePdfPage(source);
+            const page = createPage(notebook.id,{width:view.width,height:view.height});
+            page.background={type:'pdf',fileId,pageIndex:i};
+            const text = await source.getTextContent(); page.text=text.items.map(t => t.str + (t.hasEOL ? '\n' : ' ')).join('');
+            notebook.pageIds.push(page.id); result.pages.push(page);
+          } finally { source.cleanup(); }
         }
         result.notebooks.push(notebook); result.files.push({id:fileId,name:file.name,mime:'application/pdf',blob:new Blob([file],{type:'application/pdf'})});
       } finally { await pdf.destroy(); }

@@ -88,7 +88,7 @@ test('バックアップは必須ストア欠落・未知版・参照切れ・�
   const raw=fixture();raw.files.push(fileRecord('jpg',jpeg()));
   raw.pages[0].items.push({id:'image',type:'image',fileId:'jpg',x:1,y:2,w:100,h:50});
   const backup=await createBackup(raw);
-  const changes=[b=>delete b.folders,b=>delete b.notebooks,b=>delete b.pages,b=>delete b.files,b=>b.version=2,b=>b.notebooks[0].folderId='missing',b=>b.counts.pages++,b=>b.files[0].base64='!!!!',b=>b.files[0].base64='Zh==',b=>b.pages[0].width=Infinity,b=>b.pages[0].background={type:'image',fileId:'missing'},b=>b.notebooks[0].pageIds.push('missing')];
+  const changes=[b=>delete b.folders,b=>delete b.notebooks,b=>delete b.pages,b=>delete b.files,b=>b.version=3,b=>b.notebooks[0].folderId='missing',b=>b.counts.pages++,b=>b.files[0].base64='!!!!',b=>b.files[0].base64='Zh==',b=>b.pages[0].width=Infinity,b=>b.pages[0].background={type:'image',fileId:'missing'},b=>b.notebooks[0].pageIds.push('missing')];
   for(const change of changes){const b=structuredClone(backup);change(b);assert.throws(()=>validateBackup(b));}
   assert.deepEqual(validateBackup(await createBackup({folders:[],notebooks:[],pages:[],files:[]})),{folders:[],notebooks:[],pages:[],files:[]});
 });
@@ -117,7 +117,7 @@ test('投げなわの線と画像を用紙端へ動かしても相対位置を�
 test('読み込みは10ページ以上のPDFの寸法と文字を取得しJPGを1冊にまとめる',async()=>{
   const pdf=new File(['%PDF-test'],'講義.pdf',{type:'application/pdf'}),jpg1=new File(['jpg'],'写真1.jpg'),jpg2=new File(['jpg'],'写真2.jpg');let destroyed=false;
   const records=await importFiles([pdf,jpg1,jpg2],null,{
-    openPdf:async()=>({numPages:12,getPage:async n=>({getViewport:()=>({width:n%2?300:500,height:n%2?500:300}),getTextContent:async()=>({items:[{str:`page ${n}`,hasEOL:true}]}),cleanup(){}}),destroy:async()=>{destroyed=true;}}),
+    openPdf:async()=>({numPages:12,getPage:async n=>({getViewport:()=>({width:n%2?300:500,height:n%2?500:300}),getOperatorList:async()=>({fnArray:[],argsArray:[]}),getTextContent:async()=>({items:[{str:`page ${n}`,hasEOL:true}]}),cleanup(){}}),destroy:async()=>{destroyed=true;}}),
     prepareImage:async file=>({...fileRecord(file.name,jpeg()),width:400,height:200})
   });
   assert.equal(records.notebooks.length,2);assert.equal(records.pages.length,14);assert.equal(records.files.length,3);assert.equal(records.notebooks[1].pageIds.length,2);assert.equal(records.pages[11].text,'page 12\n');assert.equal(records.pages[1].width,500);assert.ok(destroyed);

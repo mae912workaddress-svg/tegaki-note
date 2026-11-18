@@ -330,15 +330,12 @@ test('REV-005: 回収失敗時は編集画面とUndoを維持し再試行でき�
 }));
 
 
-test('REV-009: F4の実一覧UIで本文破損PDFのエラーを表示し全ストアを保持する',()=>withDOM(async()=>{
-  const source=await PDFDocument.create();source.addPage().drawText('Contents');
-  const parsed=await PDFDocument.load(await source.save());
-  const bytes=parsed.getPage(0).node.Contents().lookup(0).getContents();bytes[0]=1;bytes[1]=2;
+test('USR-001/REV-009: F4の実一覧UIでPDF.jsが開けないPDFのエラーを表示し全ストアを保持する',()=>withDOM(async()=>{
   const raw=imageRecords(),db=memoryDB(raw),repo=new Repository(db),root=new Node(),errors=[],before=structuredClone(db.state);
   const cleanup=mountLibrary(root,repo,{...raw,warnings:[]},{openNotebook:async()=>{throw new Error('must not open');},reload:async()=>{},report:e=>errors.push(e)});
   try{
     const picker=all(root).find(n=>n.getAttribute('accept')==='application/pdf,image/jpeg');
-    picker.files=[new File([await parsed.save()],'broken.pdf',{type:'application/pdf'})];await picker.emit('change');
-    assert.match(errors[0],/本文ストリームを展開できません/);assert.equal(db.observed.length,0);assert.deepEqual(db.state,before);
+    picker.files=[new File(['%PDF-1.7\nnot a document'],'broken.pdf',{type:'application/pdf'})];await picker.emit('change');
+    assert.match(errors[0],/PDFを開けません/);assert.equal(db.observed.length,0);assert.deepEqual(db.state,before);
   }finally{cleanup();}
 }));

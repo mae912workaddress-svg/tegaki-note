@@ -1,18 +1,17 @@
-import { getStroke } from '../../vendor/perfect-freehand/index.mjs';
+import { strokeOutline } from './strokes.js';
 import { templateGeometry } from '../model/templates.js';
 import { itemWidth, itemHeight, fitImage } from '../model/images.js';
 export function configureCanvas(canvas, page, scale, dpr = globalThis.devicePixelRatio || 1) {
-  // Bound each layer to 1.8 megapixels and 1.6 backing pixels per page point.
-  const ratio = Math.min(dpr * scale, 1.6, Math.sqrt(1800000 / (page.width * page.height)));
-  canvas.width = Math.ceil(page.width * ratio); canvas.height = Math.ceil(page.height * ratio);
+  // Match CSS scale × DPR until the explicit per-layer memory/edge cap.
+  const ratio = Math.min(dpr * scale, Math.sqrt(4000000 / (page.width * page.height)), 4096 / Math.max(page.width, page.height));
+  canvas.width = Math.max(1, Math.floor(page.width * ratio)); canvas.height = Math.max(1, Math.floor(page.height * ratio));
   canvas.style.width = `${page.width * scale}px`; canvas.style.height = `${page.height * scale}px`;
-  const ctx = canvas.getContext('2d'); ctx.setTransform(ratio, 0, 0, ratio, 0, 0); return ctx;
+  const ctx = canvas.getContext('2d'); ctx.setTransform(canvas.width / page.width, 0, 0, canvas.height / page.height, 0, 0); return ctx;
 }
 export function clearCanvas(ctx) { ctx.save(); ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height); ctx.restore(); }
 export function drawStroke(ctx, stroke, selected = false) {
   const highlighter = stroke.tool === 'highlighter';
-  const points = highlighter ? stroke.points.map(([x, y]) => [x, y, .5]) : stroke.points;
-  const outline = getStroke(points, { size: stroke.size, thinning: highlighter ? 0 : .65, smoothing: .5, streamline: .3, simulatePressure: false, last: true });
+  const outline = strokeOutline(stroke);
   if (!outline.length) return;
   ctx.save(); ctx.globalAlpha = highlighter ? .35 : 1; ctx.fillStyle = stroke.color;
   ctx.beginPath(); ctx.moveTo(...outline[0]);

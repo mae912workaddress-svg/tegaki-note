@@ -78,3 +78,41 @@ test('ページパネルの複製・上下移動・しおり絞り込みが実UI
     await find(document.body,'閉じる').click();await pending;assert.deepEqual(errors,[]);
   }finally{cleanup();}
 }));
+
+
+test('USR-002/003: 実UIでcoalesced入力を毎フレーム全消去・再描画し、確定時も同一輪郭で残像を消す',()=>withDOM(async()=>{
+  const scheduled=new Map();let next=0;
+  globalThis.requestAnimationFrame=fn=>{scheduled.set(++next,fn);return next;};
+  globalThis.cancelAnimationFrame=id=>scheduled.delete(id);
+  const flush=()=>{const jobs=[...scheduled.values()];scheduled.clear();jobs.forEach(fn=>fn());};
+  const root=new Node(),n=createNotebook(),errors=[];
+  const cleanup=mountEditor(root,{savePage:async()=>{}},n.notebook,n.pages,{back:async()=>{},report:e=>errors.push(e)});
+  try {
+    await settle();
+    const stack=all(root).find(n=>n.className==='page-stack'),shell=all(root).find(n=>n.dataset.page);
+    const [base,live]=shell.children.filter(n=>n.tagName==='canvas'),trace=[];
+    for(const [name,canvas] of [['base',base],['live',live]])for(const method of ['save','setTransform','clearRect','restore','beginPath','moveTo','lineTo','closePath','fill'])canvas.getContext()[method]=(...args)=>trace.push([name,method,...args]);
+    const event=(x,pressure=.5)=>({target:shell,pointerType:'pen',pointerId:1,clientX:x*1.2,clientY:144,pressure});
+    await stack.emit('pointerdown',event(20,.4));
+    await stack.emit('pointermove',{...event(50),getCoalescedEvents:()=>[event(30),event(40),event(50)]});
+    assert.equal(scheduled.size,1);assert.equal(trace.length,0);flush();
+    assert.deepEqual(trace.slice(0,4),[['live','save'],['live','setTransform',1,0,0,1,0,0],['live','clearRect',0,0,live.width,live.height],['live','restore']]);
+    assert.equal(trace.filter(c=>c[0]==='live'&&c[1]==='clearRect').length,1);
+    trace.length=0;
+    await stack.emit('pointermove',{...event(80),getCoalescedEvents:()=>[event(60),event(70),event(80)]});flush();
+    assert.equal(trace.filter(c=>c[0]==='live'&&c[1]==='clearRect').length,1);
+    const path=trace.filter(c=>c[0]==='live'&&['moveTo','lineTo'].includes(c[1])).map(c=>c.slice(1));
+    trace.length=0;
+    await stack.emit('pointerup',event(80,0));
+    assert.equal(n.pages[0].strokes[0].points.length,7);assert.equal(n.pages[0].strokes[0].points.at(-1)[2],.5);
+    const committed=trace.filter(c=>c[0]==='base'&&['moveTo','lineTo'].includes(c[1])).map(c=>c.slice(1));
+    assert.deepEqual(committed,path);
+    assert.ok(trace.findIndex(c=>c[0]==='live'&&c[1]==='clearRect')<trace.findIndex(c=>c[0]==='base'&&c[1]==='clearRect'));
+    assert.equal(scheduled.size,0);
+    trace.length=0;await stack.emit('pointerdown',{...event(90),pointerId:2});await stack.emit('pointercancel',{pointerId:2});
+    assert.ok(trace.some(c=>c[0]==='live'&&c[1]==='clearRect'));assert.equal(scheduled.size,0);assert.equal(n.pages[0].strokes.length,1);
+    await all(root).find(n=>n.getAttribute('aria-label')==='拡大').click();
+    assert.equal(base.width,live.width);assert.equal(base.height,live.height);
+    assert.deepEqual(errors,[]);
+  }finally{cleanup();}
+}));

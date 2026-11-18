@@ -24,6 +24,10 @@ export function decodeBase64(text) {
   for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
   return bytes;
 }
+async function sha256(bytes) {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(n => n.toString(16).padStart(2, '0')).join('');
+}
 export async function createBackup(raw, now = new Date()) {
   const records = assertRecords(raw), files = [];
   const used = new Set(records.pages.flatMap(page => [
@@ -31,17 +35,21 @@ export async function createBackup(raw, now = new Date()) {
     ...page.items.filter(item => item.type === 'image').map(item => item.fileId)
   ]));
   records.files = records.files.filter(file => used.has(file.id));
-  for (const { blob, editingLeases, ...record } of records.files) files.push({ ...record, base64:encode(new Uint8Array(await blob.arrayBuffer())) });
-  return { format:'tegaki-backup', version:1, createdAt:now.toISOString(), counts:Object.fromEntries(STORES.map(s => [s, records[s].length])), ...records, files };
+  for (const { blob, editingLeases, sha256:oldHash, byteLength:oldLength, ...record } of records.files) {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    files.push({ ...record, base64:encode(bytes), byteLength:bytes.length, sha256:await sha256(bytes) });
+  }
+  return { format:'tegaki-backup', version:2, createdAt:now.toISOString(), counts:Object.fromEntries(STORES.map(s => [s, records[s].length])), ...records, files };
 }
 export function validateBackup(input) {
   const data = typeof input === 'string' ? JSON.parse(input) : input;
-  if (!data || data.format !== 'tegaki-backup' || data.version !== 1 || typeof data.createdAt !== 'string' || !Number.isFinite(Date.parse(data.createdAt))) throw new Error('バックアップ形式・版数・作成日時が不正です');
+  if (!data || data.format !== 'tegaki-backup' || ![1,2].includes(data.version) || typeof data.createdAt !== 'string' || !Number.isFinite(Date.parse(data.createdAt))) throw new Error('バックアップ形式・版数・作成日時が不正です');
   if (STORES.some(s => !Array.isArray(data[s]) || !Number.isSafeInteger(data.counts?.[s]) || data.counts[s] !== data[s].length)) throw new Error('必須ストアまたは件数が不正です');
   const files = [];
   for (const file of data.files) {
     if (!file || typeof file !== 'object') throw new Error('ファイルが不正です');
-    const { base64, ...record } = file;
+    const { base64, sha256, byteLength, ...record } = file;
+    if (data.version === 2 && (!Number.isSafeInteger(byteLength) || byteLength <= 0 || typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(sha256))) throw new Error('ファイルのSHA-256・バイト長が不正です');
     files.push({ ...record, blob:new Blob([decodeBase64(base64)], { type:record.mime }) });
   }
   return assertRecords({ ...data, files });
@@ -49,7 +57,20 @@ export function validateBackup(input) {
 // Keep the synchronous structure validator for callers inspecting metadata.
 // Restoring must use this full preflight, including the decoded file bodies.
 export async function prepareBackupRestore(input, options) {
-  return validateFileContents(validateBackup(input), options);
+  const data = typeof input === 'string' ? JSON.parse(input) : input;
+  const records = validateBackup(data);
+  // Verify every file before parsing or replacing stores. Missing v2 integrity
+  // fields must never silently downgrade to the legacy path.
+  if (data.version === 2) {
+    for (let i = 0; i < records.files.length; i++) {
+      const file = records.files[i], expected = data.files[i];
+      const bytes = new Uint8Array(await file.blob.arrayBuffer());
+      if (bytes.length !== expected.byteLength || await sha256(bytes) !== expected.sha256)
+        throw new Error(`バックアップのファイル「${file.name}」を読めません: SHA-256またはバイト長が一致しません`);
+    }
+  }
+  // Also check page references and decodability, including legacy v1 files.
+  return validateFileContents(records, options);
 }
 export function backupName(date = new Date()) {
   const pad = n => String(n).padStart(2,'0');
