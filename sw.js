@@ -1,5 +1,5 @@
 /* Bump this version whenever deploying changed assets. */
-const CACHE = 'tegaki-note-v1.3.0';
+const CACHE = 'tegaki-note-v1.3.2';
 importScripts('./precache.js');
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(self.PRECACHE)));

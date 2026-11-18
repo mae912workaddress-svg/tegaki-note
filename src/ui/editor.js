@@ -3,8 +3,8 @@ import { addPage, removePage, duplicatePage, reorderPages, uid } from '../model/
 import { History } from '../model/history.js';
 import { eraseAt, selectStrokes, strokeHit } from '../model/geometry.js';
 import { Autosave } from '../storage/autosave.js';
-import { configureCanvas, clearCanvas, drawStroke, renderPage, releaseCanvas, textLines } from '../render/page.js';
-import { pointerPressure, appendStrokePoint } from '../render/strokes.js';
+import { configureCanvas, clearCanvas, drawStrokePreview, renderPage, releaseCanvas, textLines } from '../render/page.js';
+import { pointerPressure, appendStrokePoint, canJoinStrokeSegments } from '../render/strokes.js';
 import { pageAssets } from '../render/assets.js';
 import { prepareImage } from '../import/images.js';
 import { itemWidth,itemHeight,fitImage } from '../model/images.js';
@@ -17,6 +17,8 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
   let notebook = initialNotebook, pages = new Map(initialPages.map(p => [p.id, p]));
   let scale = 1, current = 0, tool = 'pen', previousTool = 'pen', color = COLORS[0], size = 2, eraserMode = 'whole', fingerDraw = false;
   let active = null, selected = { pageId: null, ids: [] }, pinch = null, gesture = null, frame = 0, scrollFrame = 0, disposed = false, busy = false;
+  let continuation = null;
+  const inputTime = event => Number.isFinite(event?.timeStamp) ? event.timeStamp : performance.now();
   const mounted = new Map(), shells = new Map(), histories = new Map(), controller = new AbortController();
   const retainedFiles = editing || repository.retainEditingFiles?.();
   const listen = (target, name, fn, options = {}) => target.addEventListener(name, fn, { ...options, signal: controller.signal });
@@ -43,11 +45,11 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
   }
   const colorGroup = el('div', { className: 'tool-group color-group', 'aria-label': 'インクの色' });
   const colorButtons = COLORS.map((c, i) => {
-    const b = button('', () => { color = c; updateToolbar(); }, 'color-choice'); b.style.backgroundColor = c;
+    const b = button('', () => { continuation = null; color = c; updateToolbar(); }, 'color-choice'); b.style.backgroundColor = c;
     b.setAttribute('aria-label', ['黒', '赤', '橙', '黄', '緑', '青', '紫', '桃'][i]); colorGroup.append(b); return b;
   });
   const sizes = el('select', { 'aria-label': 'ペンの太さ' }, ...[1, 2, 4, 7, 12].map(n => option(n, `${n} pt`))); sizes.value = String(size);
-  listen(sizes, 'change', () => { size = Number(sizes.value); });
+  listen(sizes, 'change', () => { continuation = null; size = Number(sizes.value); });
   const eraseMode = el('select', { 'aria-label': '消しゴム方式' }, option('whole', '線ごと消す'), option('partial', '部分を消す'));
   listen(eraseMode, 'change', () => { eraserMode = eraseMode.value; });
   const undo = button('↶ 戻す', () => historyAction('undo')), redo = button('↷ やり直す', () => historyAction('redo'));
@@ -141,7 +143,10 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
   }
   function redraw(id) {
     const layer = mounted.get(id), page = pages.get(id);
-    if (layer && page) renderPage(layer.baseContext, page, selected.pageId === id ? selected.ids : [],layer.assets);
+    // Asset refreshes must also keep the stroke now owned by the live layer hidden.
+    const preview = active?.pageId === id && active.joinPreview
+      ? { ...page, strokes:page.strokes.filter(s => s.id !== active.joinedStroke.id) } : page;
+    if (layer && page) renderPage(layer.baseContext, preview, selected.pageId === id ? selected.ids : [],layer.assets);
   }
   function refreshAssets(id){
     const layer=mounted.get(id),page=pages.get(id);if(!layer||!page)return;
@@ -150,6 +155,7 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
     pageAssets(snapshot,fileId=>repository.getFile(fileId),ratio,layer.loading.signal).then(assets=>{
       if(disposed||mounted.get(id)!==layer||layer.version!==version){assets.release();return;}
       layer.assets?.release();layer.assets=assets;redraw(id);
+      if (active?.pageId === id) schedulePaint();
     }).catch(error=>{if(!disposed&&mounted.get(id)===layer&&layer.version===version)report(error.message);});
   }
   function unmount(id) {
@@ -200,6 +206,7 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
   function jumpToCurrent() { const shell = shells.get(notebook.pageIds[current]); scroller.scrollTop = shell.offsetTop - 24; updateViewport(); }
   function setScale(next, clientX, clientY) {
     if (busy || active?.type === 'pen') return;
+    continuation = null;
     next = Math.max(.5, Math.min(4, next)); if (Math.abs(next - scale) < .002) return;
     const bounds = scroller.getBoundingClientRect(), x = clientX == null ? bounds.width / 2 : clientX - bounds.left, y = clientY == null ? bounds.height / 2 : clientY - bounds.top;
     // Anchor the same page point under the pinch midpoint despite fixed page gaps.
@@ -218,6 +225,7 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
     return [Math.max(0, Math.min(p.width, (event.clientX - rect.left) / scale)), Math.max(0, Math.min(p.height, (event.clientY - rect.top) / scale)), pointerPressure(event)];
   }
   function commit(page, before) {
+    continuation = null;
     if (history(page.id).commit(before, pageContent(page))) autosave.mark(page); updateToolbar();
   }
   async function editText(page,item,point=[page.width/4,page.height/4]) {
@@ -241,6 +249,7 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
   }
   async function historyAction(action) {
     if (active || busy) return;
+    continuation = null;
     setBusy(true);
     try {
       await retainedFiles?.ensure?.();
@@ -258,7 +267,13 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
     if (!active) return;
     const layer = mounted.get(active.pageId); if (!layer) return;
     clearCanvas(layer.liveContext);
-    if (active.mode === 'draw') drawStroke(layer.liveContext, active.stroke);
+    if (active.mode === 'draw') {
+      if (active.joinedStroke && !active.joinPreview) {
+        active.joinPreview = true;
+        redraw(active.pageId);
+      }
+      drawStrokePreview(layer.liveContext, pages.get(active.pageId), active.joinedStroke || active.stroke, layer.assets);
+    }
     else if (active.mode === 'lasso') {
       const ctx = layer.liveContext; ctx.save(); ctx.lineWidth = 1.3 / scale; ctx.strokeStyle = '#278be0'; ctx.fillStyle = '#278be012'; ctx.setLineDash([5 / scale, 3 / scale]); ctx.beginPath();
       active.points.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)); ctx.closePath(); ctx.fill(); ctx.stroke(); ctx.restore();
@@ -271,13 +286,27 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
     for (let i = 1; i <= steps; i++) page.strokes = eraseAt(page.strokes, [previous[0] + (point[0] - previous[0]) * i / steps, previous[1] + (point[1] - previous[1]) * i / steps], radius, active.eraseMode);
     active.last = point;
   }
-  function finishInput(commitInput) {
+  function finishInput(commitInput, event = null) {
+    continuation = null;
     if (!active) return;
     const a = active, page = pages.get(a.pageId); active = null;
     if (frame) { cancelAnimationFrame(frame); frame = 0; }
     const layer = mounted.get(a.pageId); if (layer) clearCanvas(layer.liveContext);
     if (!commitInput) { Object.assign(page,a.before); }
-    else if (a.mode === 'draw') { page.strokes = [...a.before.strokes, a.stroke]; commit(page, a.before); }
+    else if (a.mode === 'draw') {
+      const segment = { points:a.stroke.points, samples:a.samples, startTime:a.startTime, endTime:event ? inputTime(event) : NaN };
+      // Save the very same point sequence used by the live preview.
+      const continued = Boolean(a.joinedStroke);
+      if (continued) a.stroke = a.joinedStroke;
+      page.strokes = [...a.before.strokes.filter(s => s.id !== a.stroke.id), a.stroke];
+      // Keep the first segment's Undo snapshot; every segment is still autosaved.
+      if (continued) autosave.mark(page);
+      else commit(page, a.before);
+      if (event && a.type === 'pen') continuation = {
+        pageId:a.pageId, stroke:a.stroke, segment, device:a.device,
+        undoEntry:history(a.pageId).past.at(-1)
+      };
+    }
     else if (a.mode === 'lasso') { selected = { pageId: a.pageId, ids: [...selectStrokes(page.strokes, a.points),...selectItems(page.items,a.points)] }; }
     else commit(page, a.before);
     const shell = shells.get(a.pageId); if (shell?.hasPointerCapture(a.pointerId)) shell.releasePointerCapture(a.pointerId);
@@ -298,6 +327,17 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
     if (tool === 'lasso' && selected.pageId === id && (page.strokes.some(s => selected.ids.includes(s.id) && strokeHit(s, point, 12 / scale)) || page.items.some(i=>selected.ids.includes(i.id)&&itemHit(i,point)))) mode = 'move';
     else if (tool === 'lasso') { const old = selected.pageId; selected = { pageId: null, ids: [] }; if (old) redraw(old); }
     active = { pageId: id, pointerId: event.pointerId, type: event.pointerType, before, mode, start: point, points: [point], radius: Math.max(6, size * 2), eraseMode: eraserMode, stroke: { id: uid(), tool, color, size: tool === 'highlighter' ? size * 5 : size, points: [point] } };
+    const previous = continuation;
+    active.startTime = inputTime(event);
+    active.samples = [[point[0], point[1], active.startTime]];
+    active.device = event.persistentDeviceId;
+    if (mode === 'draw' && event.pointerType === 'pen' && previous?.pageId === id &&
+        previous.device === active.device &&
+        previous.stroke === page.strokes.at(-1) && previous.undoEntry === history(id).past.at(-1) &&
+        previous.stroke.tool === tool && previous.stroke.color === color && previous.stroke.size === active.stroke.size) {
+      active.continuation = previous;
+    }
+    continuation = null;
     shell.setPointerCapture(event.pointerId);
     if (mode === 'erase') applyEraser(point);
     schedulePaint(); updateToolbar();
@@ -308,7 +348,27 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
     const events = typeof event.getCoalescedEvents === 'function' ? event.getCoalescedEvents() : [];
     for (const e of events.length ? events : [event]) {
       const point = coordinates(e, active.pageId), page = pages.get(active.pageId);
-      if (active.mode === 'draw') appendStrokePoint(active.stroke.points, point, { terminal:terminal && active.type === 'pen' });
+      if (active.mode === 'draw') {
+        const count = active.stroke.points.length;
+        appendStrokePoint(active.stroke.points, point, { terminal:terminal && active.type === 'pen' });
+        const end = active.stroke.points.at(-1);
+        // Keep stationary timestamps to distinguish a deliberate stop from a dropout.
+        // Rejected coordinate outliers must not influence the motion estimate.
+        if (Math.hypot(point[0]-end[0], point[1]-end[1]) < .02) {
+          active.samples.push([end[0], end[1], inputTime(e)]);
+          active.samples = active.samples.slice(-4);
+        }
+        if (active.joinedStroke) {
+          if (active.stroke.points.length > count) appendStrokePoint(active.joinedStroke.points, end);
+        } else if (active.continuation && canJoinStrokeSegments(active.continuation.segment, {
+          points:active.stroke.points, startTime:active.startTime
+        })) {
+          // Latch once motion proves a continuation. Keep the segment separate for
+          // the next dropout's motion test; later pauses must not undo a visible join.
+          active.joinedStroke = structuredClone(active.continuation.stroke);
+          for (const p of active.stroke.points) appendStrokePoint(active.joinedStroke.points, p);
+        }
+      }
       else if (active.mode === 'lasso') active.points.push(point);
       else if (active.mode === 'erase') applyEraser(point);
       else Object.assign(page,moveContent(active.before,selected.ids,point[0]-active.start[0],point[1]-active.start[1],page.width,page.height));
@@ -316,9 +376,12 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
     schedulePaint();
   }
   listen(stack, 'pointermove', moveInput);
-  listen(stack, 'pointerup', event => { if (active?.pointerId === event.pointerId) { moveInput(event, true); finishInput(true); } });
-  listen(stack, 'pointercancel', event => { if (active?.pointerId === event.pointerId) finishInput(false); });
-  listen(stack, 'lostpointercapture', event => { if (active?.pointerId === event.pointerId) finishInput(false); });
+  listen(stack, 'pointerup', event => { if (active?.pointerId === event.pointerId) { moveInput(event, true); finishInput(true, event); } });
+  const cancelPointer = event => {
+    if (active?.pointerId === event.pointerId) finishInput(active.type === 'pen' && active.mode === 'draw', event);
+  };
+  listen(stack, 'pointercancel', cancelPointer);
+  listen(stack, 'lostpointercapture', cancelPointer);
   const touches = event => [...event.touches].filter(t => t.touchType !== 'stylus');
   const metrics = list => ({ distance: Math.hypot(list[0].clientX - list[1].clientX, list[0].clientY - list[1].clientY), x: (list[0].clientX + list[1].clientX) / 2, y: (list[0].clientY + list[1].clientY) / 2 });
   function touchHandler(event) {
@@ -335,7 +398,7 @@ export function mountEditor(root, repository, initialNotebook, initialPages, { b
   listen(scroller, 'touchmove', touchHandler, { passive: false });
   let lastTap = 0;
   listen(scroller, 'touchend', event => { if (touches(event).length < 2) pinch = null; const now = Date.now(); if (now - lastTap < 300) event.preventDefault(); lastTap = now; }, { passive: false });
-  listen(scroller, 'touchcancel', () => { pinch = null; finishInput(false); });
+  listen(scroller, 'touchcancel', event => { pinch = null; if (active) finishInput(active.type === 'pen' && active.mode === 'draw', event); });
   listen(scroller, 'gesturestart', event => { event.preventDefault(); if (!pinch && !active) gesture = { scale }; }, { passive: false });
   listen(scroller, 'gesturechange', event => { event.preventDefault(); if (gesture && !pinch) setScale(gesture.scale * event.scale, event.clientX, event.clientY); }, { passive: false });
   listen(scroller, 'gestureend', event => { event.preventDefault(); gesture = null; }, { passive: false });

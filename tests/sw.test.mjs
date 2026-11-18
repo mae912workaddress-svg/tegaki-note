@@ -11,7 +11,7 @@ function worker() {
   const cache = { async addAll(paths) { additions.push(...paths); }, async put(req, response) { responses.set(key(req), response); }, async match(req) { return responses.get(key(req))?.clone(); } };
   const context = {
     self: { location: { origin: 'https://example.test' }, registration: { scope }, clients: { claim: async () => {} }, addEventListener: (name, fn) => { listeners[name] = fn; } },
-    caches: { open: async () => cache, keys: async () => ['tegaki-note-v0', 'tegaki-note-v1.1.1', 'tegaki-note-v1.2.0', 'tegaki-note-v1.3.0', 'unrelated-app'], delete: async name => { deleted.push(name); } },
+    caches: { open: async () => cache, keys: async () => ['tegaki-note-v0', 'tegaki-note-v1.1.1', 'tegaki-note-v1.2.0', 'tegaki-note-v1.3.0', 'tegaki-note-v1.3.1', 'tegaki-note-v1.3.2', 'unrelated-app'], delete: async name => { deleted.push(name); } },
     fetch: async () => { if (!online) throw new Error('offline'); return new Response(body, { status }); }, URL, Response,
     importScripts: () => { context.self.PRECACHE = ['./', './index.html']; }
   };
@@ -36,6 +36,6 @@ test('オフラインのナビゲーションはサブパスのindexを返す', 
   const response = await w.fire('fetch', { url: 'https://example.test/repo/?from=home', method: 'GET', mode: 'navigate' }); assert.equal(await response.text(), 'app shell');
 });
 test('activate は旧版だけを削除し、外部オリジンとPOSTを扱わない', async () => {
-  const w = worker(); await w.fire('activate'); assert.deepEqual(w.deleted, ['tegaki-note-v0', 'tegaki-note-v1.1.1', 'tegaki-note-v1.2.0']);
+  const w = worker(); await w.fire('activate'); assert.deepEqual(w.deleted, ['tegaki-note-v0', 'tegaki-note-v1.1.1', 'tegaki-note-v1.2.0', 'tegaki-note-v1.3.0', 'tegaki-note-v1.3.1']);
   assert.equal(await w.fire('fetch', new Request('https://other.test/')), undefined); assert.equal(await w.fire('fetch', new Request('https://example.test/repo/', { method: 'POST' })), undefined);
 });
